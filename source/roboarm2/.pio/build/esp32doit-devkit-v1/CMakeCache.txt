@@ -305,7 +305,7 @@ ENABLE_PROGRAMS:BOOL=
 ENABLE_TESTING:BOOL=
 
 //No help, variable specified on the command line.
-EXTRA_COMPONENT_DIRS:PATH=C:/Users/ArielZaken/Documents/PlatformIO/Projects/roboarm/source/roboarm2/src
+EXTRA_COMPONENT_DIRS:PATH=c:/Users/ArielZaken/Documents/PlatformIO/Projects/roboarm/source/roboarm2/src
 
 //Generate the auto-generated files as needed
 GEN_FILES:BOOL=
@@ -353,7 +353,7 @@ PYTHON:UNINITIALIZED=C:\Users\ArielZaken\.platformio\penv\.espidf-5.5.0\Scripts\
 PYTHON_DEPS_CHECKED:UNINITIALIZED=1
 
 //No help, variable specified on the command line.
-SDKCONFIG:UNINITIALIZED=C:\Users\ArielZaken\Documents\PlatformIO\Projects\roboarm\source\roboarm2\sdkconfig.esp32doit-devkit-v1
+SDKCONFIG:UNINITIALIZED=c:\Users\ArielZaken\Documents\PlatformIO\Projects\roboarm\source\roboarm2\sdkconfig.esp32doit-devkit-v1
 
 //Allow unsafe builds. These builds ARE NOT SECURE.
 UNSAFE_BUILD:BOOL=OFF
