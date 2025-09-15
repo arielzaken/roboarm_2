@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys, time, threading, queue, argparse, traceback, re, os
+import sys, time, threading, queue, argparse, traceback, re
 import serial
 
 # ---------------------- RX/State ----------------------
+
+EOF_SENTINEL = {"type": "eof"}
 
 _rxq = queue.Queue(maxsize=8192)   # acks only: "ok", "error:...", "alarm:..."
 _last_state = "Unknown"
@@ -211,8 +213,7 @@ def send_homing_with_retries(ser: serial.Serial, homing_cmd: str, max_tries=5, a
 
 # Outbound work items:
 # - {"type":"gcode", "line": "G0 X10"}
-# - {"type":"home"}     (special)
-# - {"type":"quit"}     (special)
+# - {"type":"home"}  (special)
 _workq = queue.Queue(maxsize=65536)
 
 def _perform_home_sequence(ser: serial.Serial, homing_retries: int) -> bool:
@@ -253,21 +254,20 @@ def _perform_home_sequence(ser: serial.Serial, homing_retries: int) -> bool:
 
 def _sender_loop(ser: serial.Serial, homing_retries: int, ack_timeout: float, line_retries: int):
 	while True:
-		if _stop.is_set():
-			return
 		try:
 			item = _workq.get(timeout=0.1)
 		except queue.Empty:
+			# If stop was requested and queue is empty, exit
+			if _stop.is_set():
+				return
 			continue
 
-		t = item.get("type")
+		if item is EOF_SENTINEL:
+			print(">> finished file")
+			while(True):
+				pass
 
-		if t == "quit":
-			print(">> %%QUIT — shutting down")
-			_stop.set()
-			return
-
-		if t == "home":
+		if item["type"] == "home":
 			print(">> %%HOME (begin sequence)")
 			ok = _perform_home_sequence(ser, homing_retries)
 			if ok:
@@ -278,100 +278,13 @@ def _sender_loop(ser: serial.Serial, homing_retries: int, ack_timeout: float, li
 				return
 			continue
 
-		if t == "gcode":
+		if item["type"] == "gcode":
 			line = item["line"]
 			ok, ack = send_gcode(ser, line, retries=line_retries, ack_timeout=ack_timeout)
 			if not ok:
 				print(f"[ERR] giving up on line: {line}  (last: {ack})", file=sys.stderr)
 			continue
 
-# ---------------------- File include support ----------------------
-
-_MAX_FILE_INCLUDE_DEPTH = 8
-
-def _strip_inline_comment(s: str) -> str:
-	"""
-	Strip common G-code comments:
-	  - ';' to end of line
-	  - '( ... )' parenthetical (greedy if multiple pairs)
-	"""
-	# remove ';' comments
-	semi = s.split(';', 1)[0]
-	# remove parenthetical blocks
-	out = []
-	depth = 0
-	for ch in semi:
-		if ch == '(':
-			depth += 1
-		elif ch == ')':
-			if depth > 0:
-				depth -= 1
-		else:
-			if depth == 0:
-				out.append(ch)
-	return ''.join(out).strip()
-
-def _parse_file_path(arg: str, base_dir: str) -> str:
-	"""
-	Handle quotes and relative paths. Expands ~ and resolves against base_dir.
-	"""
-	arg = arg.strip()
-	if arg.startswith('"') and arg.endswith('"') and len(arg) >= 2:
-		arg = arg[1:-1]
-	elif arg.startswith("'") and arg.endswith("'") and len(arg) >= 2:
-		arg = arg[1:-1]
-	arg = os.path.expanduser(arg)
-	if not os.path.isabs(arg):
-		arg = os.path.normpath(os.path.join(base_dir, arg))
-	return arg
-
-def _enqueue_line_text(raw_line: str, base_dir: str, depth: int):
-	"""
-	Process a single textual line: handle directives (%%HOME, %%FILE, %%QUIT),
-	otherwise enqueue as G-code. Strips comments/blank lines.
-	"""
-	line = _strip_inline_comment(raw_line).strip()
-	if not line:
-		return
-
-	if line.startswith("%%QUIT"):
-		_workq.put({"type":"quit"})
-		return
-
-	if line.startswith("%%HOME"):
-		_workq.put({"type":"home"})
-		return
-
-	if line.startswith("%%FILE"):
-		if depth >= _MAX_FILE_INCLUDE_DEPTH:
-			print(f"[ERR] %%FILE nesting limit ({_MAX_FILE_INCLUDE_DEPTH}) reached; skipping.", file=sys.stderr)
-			return
-		rest = line[len("%%FILE"):].strip()
-		if not rest:
-			print("[ERR] %%FILE requires a path.", file=sys.stderr)
-			return
-		path = _parse_file_path(rest, base_dir)
-		_enqueue_file_contents(path, depth + 1)
-		return
-
-	# default: gcode
-	_workq.put({"type":"gcode", "line": line})
-
-def _enqueue_file_contents(path: str, depth: int):
-	try:
-		with open(path, "r", encoding="utf-8", errors="ignore") as f:
-			lines = f.readlines()
-	except Exception as e:
-		print(f"[ERR] %%FILE failed to open '{path}': {e}", file=sys.stderr)
-		return
-
-	print(f">> %%FILE BEGIN  {path}  ({len(lines)} lines)")
-	base_dir = os.path.dirname(path) or "."
-	for raw in lines:
-		if _stop.is_set():
-			break
-		_enqueue_line_text(raw, base_dir, depth)
-	print(f">> %%FILE END    {path}")
 
 # ---------------------- Session/wake ----------------------
 
@@ -386,7 +299,7 @@ def wake_and_sync(ser: serial.Serial):
 # ---------------------- Main ----------------------
 
 def main():
-	parser = argparse.ArgumentParser(description="stdin-driven G-code streamer with %%HOME, %%FILE, and %%QUIT macros.")
+	parser = argparse.ArgumentParser(description="stdin-driven G-code streamer with %%HOME macro.")
 	parser.add_argument("--port", default="COM7")
 	parser.add_argument("--baud", type=int, default=115200)
 	parser.add_argument("--no-wake", action="store_true")
@@ -405,31 +318,31 @@ def main():
 	rx_t.start()
 	tx_t.start()
 
-	# Producer: read stdin and enqueue work; after EOF keep session alive
-	stdin_base_dir = os.getcwd()
+	# Producer: read stdin and enqueue work
 	try:
 		for raw in sys.stdin:
 			if _stop.is_set():
 				break
-			_enqueue_line_text(raw, stdin_base_dir, depth=0)
-
-		# stdin closed: keep running until %%QUIT or Ctrl+C
-		print("[INFO] stdin closed — session remains open. Use %%QUIT or Ctrl+C to exit.")
-		while not _stop.is_set():
-			time.sleep(0.25)
-
-	except KeyboardInterrupt:
-		print("\n[INFO] KeyboardInterrupt — shutting down")
-		_stop.set()
+			line = raw.strip()
+			if not line:
+				continue
+			if line == "%%HOME":
+				_workq.put({"type":"home"})
+			else:
+				_workq.put({"type":"gcode", "line": line})
 	finally:
-		# Graceful shutdown
-		tx_t.join(timeout=2.0)
+		# Signal no more input, but DON'T stop yet—let TX drain and exit cleanly
+		_workq.put(EOF_SENTINEL)
+		# Wait for TX to finish everything (no timeout)
+		tx_t.join()
+		# Now we can stop RX and close
 		_stop.set()
 		rx_t.join(timeout=1.0)
 		try:
 			ser.close()
 		except Exception:
 			pass
+
 
 if __name__ == "__main__":
 	main()
